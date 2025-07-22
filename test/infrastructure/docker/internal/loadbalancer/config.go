@@ -29,7 +29,9 @@ type ConfigData struct {
 	FrontendControlPlanePort string
 	BackendControlPlanePort  string
 	BackendServers           map[string]BackendServer
+	ExternalServers          map[string]BackendServer
 	IPv6                     bool
+	UseExternalOnly          bool
 }
 
 // BackendServer defines a loadbalancer backend.
@@ -79,8 +81,19 @@ frontend control-plane
 
 backend kube-apiservers
   option httpchk GET /healthz
+  {{- if .UseExternalOnly }}
+  {{range $server, $backend := .ExternalServers}}
+  server {{ $server }} {{ JoinHostPort $backend.Address $.BackendControlPlanePort }} weight {{ $backend.Weight }} check check-ssl verify none
+  {{- end}}
+  {{- else }}
   {{range $server, $backend := .BackendServers}}
   server {{ $server }} {{ JoinHostPort $backend.Address $.BackendControlPlanePort }} weight {{ $backend.Weight }} check check-ssl verify none resolvers docker resolve-prefer {{ if $.IPv6 -}} ipv6 {{- else -}} ipv4 {{- end }}
+  {{- end}}
+  {{- if .ExternalServers }}
+  {{range $server, $backend := .ExternalServers}}
+  server {{ $server }} {{ JoinHostPort $backend.Address $.BackendControlPlanePort }} weight {{ $backend.Weight }} check check-ssl verify none
+  {{- end}}
+  {{- end }}
   {{- end}}
 `
 

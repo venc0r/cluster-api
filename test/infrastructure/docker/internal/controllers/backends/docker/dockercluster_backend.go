@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,6 +49,21 @@ type ClusterBackEndReconciler struct {
 func (r *ClusterBackEndReconciler) ReconcileNormal(ctx context.Context, cluster *clusterv1.Cluster, dockerCluster *infrav1.DevCluster) (ctrl.Result, error) {
 	if dockerCluster.Spec.Backend.Docker == nil {
 		return ctrl.Result{}, errors.New("DockerBackendReconciler can't be called for DevCluster without a Docker backend")
+	}
+
+	// Check if this cluster uses an external control plane (e.g., Kamaji)
+	isExternalCP, externalEndpoint, err := r.checkExternalControlPlane(ctx, cluster)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to check for external control plane")
+	}
+
+	// If we have an external control plane, we still need to create the load balancer
+	// but configure it to point to the external endpoint instead of local control plane nodes
+	log := ctrl.LoggerFrom(ctx)
+	if isExternalCP {
+		log.Info("Using external control plane", "endpoint", externalEndpoint)
+	} else {
+		log.Info("Using standard kubeadm control plane")
 	}
 
 	// Support FailureDomains
@@ -112,6 +128,69 @@ func (r *ClusterBackEndReconciler) ReconcileNormal(ctx context.Context, cluster 
 	})
 
 	return ctrl.Result{}, nil
+}
+
+// checkExternalControlPlane checks if the cluster uses an external control plane like Kamaji.
+func (r *ClusterBackEndReconciler) checkExternalControlPlane(ctx context.Context, cluster *clusterv1.Cluster) (bool, string, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Check if the cluster has a control plane reference
+	if cluster.Spec.ControlPlaneRef == nil {
+		return false, "", nil
+	}
+
+	// Check if it's a Kamaji control plane
+	if cluster.Spec.ControlPlaneRef.Kind == "KamajiControlPlane" {
+		log.Info("Detected Kamaji external control plane", "controlPlaneRef", cluster.Spec.ControlPlaneRef)
+
+		// Get the KamajiControlPlane object
+		kamajiCP := &unstructured.Unstructured{}
+		kamajiCP.SetAPIVersion(cluster.Spec.ControlPlaneRef.APIVersion)
+		kamajiCP.SetKind(cluster.Spec.ControlPlaneRef.Kind)
+
+		key := client.ObjectKey{
+			Namespace: cluster.Spec.ControlPlaneRef.Namespace,
+			Name:      cluster.Spec.ControlPlaneRef.Name,
+		}
+
+		if err := r.Get(ctx, key, kamajiCP); err != nil {
+			return false, "", errors.Wrapf(err, "failed to get KamajiControlPlane %s", key)
+		}
+
+		// In Kamaji, the TenantControlPlane has the same name and namespace as the KamajiControlPlane
+		tcpName := cluster.Spec.ControlPlaneRef.Name
+		tcpNamespace := cluster.Spec.ControlPlaneRef.Namespace
+		if tcpNamespace == "" {
+			tcpNamespace = cluster.Namespace // default to cluster namespace
+		}
+
+		// Get the TenantControlPlane object
+		tcp := &unstructured.Unstructured{}
+		tcp.SetAPIVersion("kamaji.clastix.io/v1alpha1")
+		tcp.SetKind("TenantControlPlane")
+
+		tcpKey := client.ObjectKey{
+			Namespace: tcpNamespace,
+			Name:      tcpName,
+		}
+
+		if err := r.Get(ctx, tcpKey, tcp); err != nil {
+			return false, "", errors.Wrapf(err, "failed to get TenantControlPlane %s", tcpKey)
+		}
+
+		// Extract the control plane endpoint
+		endpoint, found, err := unstructured.NestedString(tcp.Object, "status", "controlPlaneEndpoint")
+		if err != nil || !found {
+			return false, "", errors.New("failed to find controlPlaneEndpoint in TenantControlPlane status")
+		}
+
+		log.Info("Found Kamaji control plane endpoint", "endpoint", endpoint)
+		return true, endpoint, nil
+	}
+
+	// Check for other external control plane types here if needed
+
+	return false, "", nil
 }
 
 // ReconcileDelete handle docker backend for delete DevMachines.

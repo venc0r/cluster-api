@@ -1,0 +1,26 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kamaji-access-role
+  labels:
+    cluster.x-k8s.io/aggregate-to-manager: "true"
+rules:
+- apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - kamajicontrolplanes
+  - kamajicontrolplanetemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kamaji.clastix.io
+  resources:
+  - tenantcontrolplanes
+  - datastores
+  verbs:
+  - get
+  - list
+  - watch

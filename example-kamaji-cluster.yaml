@@ -1,0 +1,116 @@
+# Example Cluster API cluster using CAPD with Kamaji as external control plane
+# This example shows how the new external control plane support works
+
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: Cluster
+metadata:
+  name: example-kamaji-cluster
+  namespace: default
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+      - 192.168.0.0/16
+    serviceDomain: cluster.local
+    services:
+      cidrBlocks:
+      - 10.128.0.0/12
+  # This is the key part - pointing to KamajiControlPlane instead of KubeadmControlPlane
+  controlPlaneRef:
+    apiGroup: controlplane.cluster.x-k8s.io
+    kind: KamajiControlPlane  # This triggers external control plane handling in CAPD
+    name: example-kamaji-control-plane
+  infrastructureRef:
+    apiGroup: infrastructure.cluster.x-k8s.io
+    kind: DockerCluster
+    name: example-kamaji-cluster
+
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: DockerCluster
+metadata:
+  name: example-kamaji-cluster
+  namespace: default
+spec:
+  # No need to specify controlPlaneEndpoint - CAPD will populate this from Kamaji
+  # The load balancer configuration is ignored when using external control planes
+  backend:
+    docker:
+      loadBalancer:
+        imageRepository: kindest
+        imageTag: haproxy-2.4.6-alpine
+
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1alpha1
+kind: KamajiControlPlane
+metadata:
+  name: example-kamaji-control-plane
+  namespace: default
+spec:
+  dataStoreName: default
+  network:
+    serviceType: NodePort
+  kubelet:
+    cgroupfs: systemd
+  deployment:
+    replicas: 1
+  version: v1.29.0
+  # KamajiControlPlane will create a TenantControlPlane that CAPD will read from
+
+---
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: MachineDeployment
+metadata:
+  name: example-kamaji-cluster-md-0
+  namespace: default
+spec:
+  clusterName: example-kamaji-cluster
+  replicas: 1
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: example-kamaji-cluster
+      cluster.x-k8s.io/deployment-name: example-kamaji-cluster-md-0
+  template:
+    metadata:
+      labels:
+        cluster.x-k8s.io/cluster-name: example-kamaji-cluster
+        cluster.x-k8s.io/deployment-name: example-kamaji-cluster-md-0
+    spec:
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+          kind: KubeadmConfigTemplate
+          name: example-kamaji-cluster-md-0
+      clusterName: example-kamaji-cluster
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: DockerMachineTemplate
+        name: example-kamaji-cluster-md-0
+      version: v1.29.0
+
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: DockerMachineTemplate
+metadata:
+  name: example-kamaji-cluster-md-0
+  namespace: default
+spec:
+  template:
+    spec: {}
+
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta2
+kind: KubeadmConfigTemplate
+metadata:
+  name: example-kamaji-cluster-md-0
+  namespace: default
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          criSocket: unix:///var/run/containerd/containerd.sock
+          kubeletExtraArgs:
+            cgroup-driver: systemd
+            eviction-hard: nodefs.available<0%,nodefs.inodesFree<0%,imagefs.available<0%

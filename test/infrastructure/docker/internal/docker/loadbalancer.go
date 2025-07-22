@@ -138,6 +138,11 @@ func (s *LoadBalancer) Create(ctx context.Context) error {
 
 // UpdateConfiguration updates the external load balancer configuration with new control plane nodes.
 func (s *LoadBalancer) UpdateConfiguration(ctx context.Context, weights map[string]int, unsafeLoadBalancerConfig string) error {
+	return s.UpdateConfigurationWithExternal(ctx, weights, unsafeLoadBalancerConfig, nil, false)
+}
+
+// UpdateConfigurationWithExternal updates the load balancer configuration with external control plane support.
+func (s *LoadBalancer) UpdateConfigurationWithExternal(ctx context.Context, weights map[string]int, unsafeLoadBalancerConfig string, externalServers map[string]loadbalancer.BackendServer, useExternalOnly bool) error {
 	log := ctrl.LoggerFrom(ctx)
 
 	if s.container == nil {
@@ -148,7 +153,9 @@ func (s *LoadBalancer) UpdateConfiguration(ctx context.Context, weights map[stri
 		FrontendControlPlanePort: s.frontendControlPlanePort,
 		BackendControlPlanePort:  s.backendControlPlanePort,
 		BackendServers:           map[string]loadbalancer.BackendServer{},
+		ExternalServers:          externalServers,
 		IPv6:                     s.ipFamily == clusterv1.IPv6IPFamily,
+		UseExternalOnly:          useExternalOnly,
 	}
 
 	// collect info about the existing controlplane nodes

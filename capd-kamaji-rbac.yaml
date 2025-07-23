@@ -1,0 +1,36 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: capd-manager-kamaji
+rules:
+- apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - kamajicontrolplanes
+  - kamajicontrolplanetemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kamaji.clastix.io
+  resources:
+  - tenantcontrolplanes
+  - datastores
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: capd-manager-kamaji
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: capd-manager-kamaji
+subjects:
+- kind: ServiceAccount
+  name: capd-manager
+  namespace: capd-system

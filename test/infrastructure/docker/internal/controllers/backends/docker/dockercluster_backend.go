@@ -59,11 +59,34 @@ func (r *ClusterBackEndReconciler) ReconcileNormal(ctx context.Context, cluster 
 		return ctrl.Result{}, errors.Wrap(err, "failed to check for external control plane")
 	}
 
-	// If we have an external control plane, we still need to create the load balancer
-	// but configure it to point to the external endpoint instead of local control plane nodes
 	log := ctrl.LoggerFrom(ctx)
 	if isExternalCP {
-		log.Info("Using external control plane", "endpoint", externalEndpoint)
+		log.Info("Using external control plane, skipping HAProxy", "endpoint", externalEndpoint)
+		
+		// For external control planes, set the ControlPlaneEndpoint directly to the external endpoint
+		// and skip HAProxy creation entirely
+		host, port, err := parseEndpoint(externalEndpoint)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "failed to parse external endpoint %s", externalEndpoint)
+		}
+		
+		if dockerCluster.Spec.ControlPlaneEndpoint.Host == "" {
+			dockerCluster.Spec.ControlPlaneEndpoint.Host = host
+		}
+		if dockerCluster.Spec.ControlPlaneEndpoint.Port == 0 {
+			dockerCluster.Spec.ControlPlaneEndpoint.Port = port
+		}
+		
+		// Mark the dockerCluster ready - no HAProxy needed
+		dockerCluster.Status.Ready = true
+		conditions.MarkTrue(dockerCluster, infrav1.LoadBalancerAvailableCondition)
+		v1beta2conditions.Set(dockerCluster, metav1.Condition{
+			Type:   infrav1.DevClusterDockerLoadBalancerAvailableV1Beta2Condition,
+			Status: metav1.ConditionTrue,
+			Reason: infrav1.DevClusterDockerLoadBalancerAvailableV1Beta2Reason,
+		})
+		
+		return ctrl.Result{}, nil
 	} else {
 		log.Info("Using standard kubeadm control plane")
 	}

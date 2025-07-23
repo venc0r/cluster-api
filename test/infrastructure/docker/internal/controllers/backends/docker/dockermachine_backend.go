@@ -211,10 +211,14 @@ func (r *MachineBackendReconciler) ReconcileNormal(ctx context.Context, cluster 
 		}
 	}
 
+	// Check if this cluster uses an external control plane (skip load balancer config if so)
+	isExternalCP := cluster.Spec.ControlPlaneRef != nil && cluster.Spec.ControlPlaneRef.Kind == "KamajiControlPlane"
+	
 	// if the machine is a control plane update the load balancer configuration
 	// we should only do this once, as reconfiguration more or less ensures
 	// node ref setting fails
-	if util.IsControlPlaneMachine(machine) && (dockerMachine.Status.Backend == nil || dockerMachine.Status.Backend.Docker == nil || !dockerMachine.Status.Backend.Docker.LoadBalancerConfigured) {
+	// Skip this for external control planes since they don't need a load balancer
+	if util.IsControlPlaneMachine(machine) && !isExternalCP && (dockerMachine.Status.Backend == nil || dockerMachine.Status.Backend.Docker == nil || !dockerMachine.Status.Backend.Docker.LoadBalancerConfigured) {
 		if err := r.reconcileLoadBalancerConfiguration(ctx, cluster, dockerCluster, externalLoadBalancer); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -437,7 +441,9 @@ func (r *MachineBackendReconciler) ReconcileDelete(ctx context.Context, cluster 
 	}
 
 	// if the deleted machine is a control-plane node, remove it from the load balancer configuration;
-	if util.IsControlPlaneMachine(machine) {
+	// Skip this for external control planes since they don't use a load balancer
+	isExternalCP := cluster.Spec.ControlPlaneRef != nil && cluster.Spec.ControlPlaneRef.Kind == "KamajiControlPlane"
+	if util.IsControlPlaneMachine(machine) && !isExternalCP {
 		if err := r.reconcileLoadBalancerConfiguration(ctx, cluster, dockerCluster, externalLoadBalancer); err != nil {
 			return ctrl.Result{}, err
 		}

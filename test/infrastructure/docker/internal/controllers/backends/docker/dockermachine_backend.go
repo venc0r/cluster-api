@@ -20,12 +20,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,6 +41,7 @@ import (
 	"sigs.k8s.io/cluster-api/test/infrastructure/container"
 	infrav1 "sigs.k8s.io/cluster-api/test/infrastructure/docker/api/v1beta1"
 	"sigs.k8s.io/cluster-api/test/infrastructure/docker/internal/docker"
+	"sigs.k8s.io/cluster-api/test/infrastructure/docker/internal/loadbalancer"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
@@ -499,21 +502,53 @@ func (r *MachineBackendReconciler) PatchDevMachine(ctx context.Context, patchHel
 }
 
 func (r *MachineBackendReconciler) reconcileLoadBalancerConfiguration(ctx context.Context, cluster *clusterv1.Cluster, dockerCluster *infrav1.DevCluster, externalLoadBalancer *docker.LoadBalancer) error {
-	controlPlaneWeight := map[string]int{}
-
-	controlPlaneMachineList := &clusterv1.MachineList{}
-	if err := r.Client.List(ctx, controlPlaneMachineList, client.InNamespace(cluster.Namespace), client.MatchingLabels{
-		clusterv1.MachineControlPlaneLabel: "",
-		clusterv1.ClusterNameLabel:         cluster.Name,
-	}); err != nil {
-		return errors.Wrap(err, "failed to list control plane machines")
+	log := ctrl.LoggerFrom(ctx)
+	
+	// Check if this cluster uses an external control plane (e.g., Kamaji)
+	isExternalCP, externalEndpoint, err := r.checkExternalControlPlane(ctx, cluster)
+	if err != nil {
+		return errors.Wrap(err, "failed to check for external control plane")
 	}
 
-	for _, m := range controlPlaneMachineList.Items {
-		containerName := docker.MachineContainerName(cluster.Name, m.Name)
-		controlPlaneWeight[containerName] = 100
-		if !m.DeletionTimestamp.IsZero() && len(controlPlaneMachineList.Items) > 1 {
-			controlPlaneWeight[containerName] = 0
+	controlPlaneWeight := map[string]int{}
+	var externalServers map[string]loadbalancer.BackendServer
+	var useExternalOnly bool
+
+	if isExternalCP && externalEndpoint != "" {
+		// For external control planes like Kamaji, configure HAProxy to forward to the external endpoint
+		log.Info("Configuring load balancer for external control plane", "endpoint", externalEndpoint)
+		
+		// Parse the endpoint to extract host and port
+		host, port, err := net.SplitHostPort(externalEndpoint)
+		if err != nil {
+			// If parsing fails, assume the endpoint is just a host without port
+			host = externalEndpoint
+			port = "6443" // Default Kubernetes API server port
+		}
+		
+		externalServers = map[string]loadbalancer.BackendServer{
+			"external-control-plane": {
+				Address: host,
+				Weight:  100,
+			},
+		}
+		useExternalOnly = true
+	} else {
+		// Standard kubeadm control plane - look for control plane machines
+		controlPlaneMachineList := &clusterv1.MachineList{}
+		if err := r.Client.List(ctx, controlPlaneMachineList, client.InNamespace(cluster.Namespace), client.MatchingLabels{
+			clusterv1.MachineControlPlaneLabel: "",
+			clusterv1.ClusterNameLabel:         cluster.Name,
+		}); err != nil {
+			return errors.Wrap(err, "failed to list control plane machines")
+		}
+
+		for _, m := range controlPlaneMachineList.Items {
+			containerName := docker.MachineContainerName(cluster.Name, m.Name)
+			controlPlaneWeight[containerName] = 100
+			if !m.DeletionTimestamp.IsZero() && len(controlPlaneMachineList.Items) > 1 {
+				controlPlaneWeight[containerName] = 0
+			}
 		}
 	}
 
@@ -521,7 +556,9 @@ func (r *MachineBackendReconciler) reconcileLoadBalancerConfiguration(ctx contex
 	if err != nil {
 		return errors.Wrap(err, "failed to retrieve HAProxy configuration from CustomHAProxyConfigTemplateRef")
 	}
-	if err := externalLoadBalancer.UpdateConfiguration(ctx, controlPlaneWeight, unsafeLoadBalancerConfigTemplate); err != nil {
+	
+	// Use UpdateConfigurationWithExternal to support both standard and external control planes
+	if err := externalLoadBalancer.UpdateConfigurationWithExternal(ctx, controlPlaneWeight, unsafeLoadBalancerConfigTemplate, externalServers, useExternalOnly); err != nil {
 		return errors.Wrap(err, "failed to update DockerCluster.loadbalancer configuration")
 	}
 	return nil
@@ -545,6 +582,68 @@ func (r *MachineBackendReconciler) getBootstrapData(ctx context.Context, namespa
 	}
 
 	return base64.StdEncoding.EncodeToString(value), bootstrapv1.Format(format), nil
+}
+
+// checkExternalControlPlane checks if the cluster uses an external control plane like Kamaji.
+func (r *MachineBackendReconciler) checkExternalControlPlane(ctx context.Context, cluster *clusterv1.Cluster) (bool, string, error) {
+	log := ctrl.LoggerFrom(ctx)
+
+	// Check if the cluster has a control plane reference
+	if cluster.Spec.ControlPlaneRef == nil {
+		return false, "", nil
+	}
+
+	// Check if it's a Kamaji control plane
+	if cluster.Spec.ControlPlaneRef.Kind == "KamajiControlPlane" {
+		log.Info("Detected Kamaji external control plane", "controlPlaneRef", cluster.Spec.ControlPlaneRef)
+
+		// Get the KamajiControlPlane object
+		kamajiCP := &unstructured.Unstructured{}
+		kamajiCP.SetAPIVersion(cluster.Spec.ControlPlaneRef.APIVersion)
+		kamajiCP.SetKind(cluster.Spec.ControlPlaneRef.Kind)
+
+		key := client.ObjectKey{
+			Namespace: cluster.Spec.ControlPlaneRef.Namespace,
+			Name:      cluster.Spec.ControlPlaneRef.Name,
+		}
+
+		if err := r.Get(ctx, key, kamajiCP); err != nil {
+			return false, "", errors.Wrapf(err, "failed to get KamajiControlPlane %s", key)
+		}
+
+		// In Kamaji, the TenantControlPlane has the same name and namespace as the KamajiControlPlane
+		tcpName := cluster.Spec.ControlPlaneRef.Name
+		tcpNamespace := cluster.Spec.ControlPlaneRef.Namespace
+		if tcpNamespace == "" {
+			tcpNamespace = cluster.Namespace // default to cluster namespace
+		}
+
+		// Get the TenantControlPlane object
+		tcp := &unstructured.Unstructured{}
+		tcp.SetAPIVersion("kamaji.clastix.io/v1alpha1")
+		tcp.SetKind("TenantControlPlane")
+
+		tcpKey := client.ObjectKey{
+			Namespace: tcpNamespace,
+			Name:      tcpName,
+		}
+
+		if err := r.Get(ctx, tcpKey, tcp); err != nil {
+			return false, "", errors.Wrapf(err, "failed to get TenantControlPlane %s", tcpKey)
+		}
+
+		// Extract the control plane endpoint from the TenantControlPlane status
+		endpoint, found, err := unstructured.NestedString(tcp.Object, "status", "controlPlaneEndpoint")
+		if err != nil || !found {
+			return false, "", errors.New("failed to find controlPlaneEndpoint in TenantControlPlane status")
+		}
+
+		log.Info("Found Kamaji control plane endpoint", "endpoint", endpoint)
+		return true, endpoint, nil
+	}
+
+	// Check for other external control plane types here if needed
+	return false, "", nil
 }
 
 func (r *MachineBackendReconciler) getUnsafeLoadBalancerConfigTemplate(ctx context.Context, dockerCluster *infrav1.DevCluster) (string, error) {

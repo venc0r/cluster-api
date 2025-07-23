@@ -20,6 +20,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/cluster-api/test/infrastructure/container"
 	infrav1 "sigs.k8s.io/cluster-api/test/infrastructure/docker/api/v1beta1"
 	"sigs.k8s.io/cluster-api/test/infrastructure/docker/internal/docker"
+	"sigs.k8s.io/cluster-api/test/infrastructure/docker/internal/loadbalancer"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta2conditions "sigs.k8s.io/cluster-api/util/conditions/v1beta2"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -97,6 +99,33 @@ func (r *ClusterBackEndReconciler) ReconcileNormal(ctx context.Context, cluster 
 			Message: fmt.Sprintf("Failed to create load balancer: %v", err),
 		})
 		return ctrl.Result{}, errors.Wrap(err, "failed to create load balancer")
+	}
+
+	// Configure the load balancer
+	if isExternalCP {
+		// For external control planes, configure HAProxy to point to the external endpoint
+		host, _, err := parseEndpoint(externalEndpoint)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "failed to parse external endpoint %s", externalEndpoint)
+		}
+
+		externalServers := map[string]loadbalancer.BackendServer{
+			"external-control-plane": {
+				Address: host,
+				Weight:  100,
+			},
+		}
+
+		// Update load balancer configuration with external servers only
+		if err := externalLoadBalancer.UpdateConfigurationWithExternal(ctx, nil, "", externalServers, true); err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "failed to update load balancer configuration for external control plane")
+		}
+		log.Info("Configured load balancer for external control plane", "endpoint", externalEndpoint)
+	} else {
+		// For standard kubeadm control planes, configure with empty weights (will be updated by control plane controller)
+		if err := externalLoadBalancer.UpdateConfiguration(ctx, map[string]int{}, ""); err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "failed to update load balancer configuration")
+		}
 	}
 
 	// Set APIEndpoints with the load balancer IP so the Cluster API Cluster Controller can pull it
@@ -286,4 +315,19 @@ func (r *ClusterBackEndReconciler) PatchDevCluster(ctx context.Context, patchHel
 			infrav1.DevClusterDockerLoadBalancerAvailableV1Beta2Condition,
 		}},
 	)
+}
+
+// parseEndpoint parses an endpoint string in the format "host:port" and returns the host and port separately.
+func parseEndpoint(endpoint string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", 0, errors.Wrapf(err, "invalid endpoint format: %s", endpoint)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, errors.Wrapf(err, "invalid port in endpoint: %s", endpoint)
+	}
+
+	return host, port, nil
 }

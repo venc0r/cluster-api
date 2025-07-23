@@ -528,7 +528,7 @@ func (r *MachineBackendReconciler) reconcileLoadBalancerConfiguration(ctx contex
 		
 		externalServers = map[string]loadbalancer.BackendServer{
 			"external-control-plane": {
-				Address: host,
+				Address: net.JoinHostPort(host, port),
 				Weight:  100,
 			},
 		}
